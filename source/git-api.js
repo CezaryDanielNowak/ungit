@@ -7,6 +7,7 @@ const mkdirp = require('mkdirp').mkdirp;
 const rimraf = require('rimraf').rimraf;
 const _ = require('lodash');
 const gitPromise = require('./git-promise');
+const aiDiff = require('./ai-diff');
 const fs = require('fs').promises;
 const chokidar = require('chokidar');
 const ignore = require('ignore');
@@ -22,6 +23,7 @@ exports.registerApi = (env) => {
   const config = env.config;
   const io = env.socketIO;
   const socketsById = env.socketsById || {};
+  const activeCommits = new Map();
 
   if (config.dev) temp.track();
 
@@ -36,8 +38,10 @@ exports.registerApi = (env) => {
         socket.join(socket.watcherPath); // join room for this path
 
         const watcher = await watchRepo(socket.watcherPath);
+        const watchedPath = socket.watcherPath;
         watcher.on('workdir', (changedPath) => {
           logger.info(`${changedPath} triggered workdir refresh for ${socket.watcherPath}`);
+          socket.emit('worktree-file-changed', { repository: watchedPath });
           emitWorkingTreeChanged(socket.watcherPath);
         });
         watcher.on('git', (changedPath) => {
@@ -365,6 +369,13 @@ exports.registerApi = (env) => {
     );
   });
 
+  app.get(`${exports.pathPrefix}/diff/ai`, ensureAuthenticated, ensurePathExists, (req, res) => {
+    jsonResultOrFailProm(
+      res,
+      aiDiff(gitPromise, req.query.path, req.query.file, req.query.oldFile)
+    );
+  });
+
   app.get(`${exports.pathPrefix}/diff/image`, ensureAuthenticated, ensurePathExists, (req, res) => {
     res.type(path.extname(req.query.filename));
     if (req.query.version !== 'current') {
@@ -406,6 +417,16 @@ exports.registerApi = (env) => {
   );
 
   app.post(`${exports.pathPrefix}/commit`, ensureAuthenticated, ensurePathExists, (req, res) => {
+    const operationId = req.body.operationId;
+    const key = JSON.stringify([req.body.socketId, operationId]);
+    if (operationId && (typeof operationId !== 'string' || operationId.length > 128)) {
+      return res.status(400).json({ error: 'Invalid commit operation ID.' });
+    }
+    if (operationId && activeCommits.has(key)) {
+      return res.status(409).json({ error: 'Commit operation already running.' });
+    }
+    const controller = new AbortController();
+    if (operationId) activeCommits.set(key, { controller, path: path.resolve(req.body.path) });
     jsonResultOrFailProm(
       res,
       gitPromise.commit(
@@ -414,12 +435,37 @@ exports.registerApi = (env) => {
         req.body.emptyCommit,
         req.body.message,
         req.body.files,
-        req.body.skipHooks === true
+        req.body.skipHooks === true,
+        {
+          signal: controller.signal,
+          onOutput: (output) => {
+            const socket = socketsById[req.body.socketId];
+            if (operationId && socket) socket.emit('commit-output', { operationId, output });
+          },
+        }
       )
     )
+      .finally(() => {
+        if (operationId) activeCommits.delete(key);
+      })
       .then(emitGitDirectoryChanged.bind(null, req.body.path))
       .then(emitWorkingTreeChanged.bind(null, req.body.path));
   });
+
+  app.post(
+    `${exports.pathPrefix}/commit/cancel`,
+    ensureAuthenticated,
+    ensurePathExists,
+    (req, res) => {
+      const key = JSON.stringify([req.body.socketId, req.body.operationId]);
+      const operation = activeCommits.get(key);
+      if (!operation || operation.path !== path.resolve(req.body.path)) {
+        return res.json({ cancelled: false });
+      }
+      operation.controller.abort();
+      res.json({ cancelled: true });
+    }
+  );
 
   app.post(`${exports.pathPrefix}/revert`, ensureAuthenticated, ensurePathExists, (req, res) => {
     const task = gitPromise(['revert', req.body.commit], req.body.path).catch((e) => {

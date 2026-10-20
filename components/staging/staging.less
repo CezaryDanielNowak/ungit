@@ -1,6 +1,27 @@
 @import 'public/less/variables.less';
 
 .staging {
+  .commit-console {
+    margin-bottom: 15px;
+
+    pre {
+      max-height: 300px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #252833;
+      color: #eee;
+      margin-top: 10px;
+    }
+  }
+
+  .commit-console-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 15px;
+  }
+
   background: #643a44;
   box-shadow: 0 -1px 15px #252833;
   color: #b8a5a5;

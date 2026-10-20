@@ -6,6 +6,8 @@ We are following the [Keep a Changelog](https://keepachangelog.com/) format.
 ## [Unreleased](https://github.com/FredrikNoren/ungit/compare/v1.5.29...master)
 
 ### Added
+- Show live commit output after 500 ms and allow cancelling Git and its hook subprocesses from the staging panel.
+- Replace staging controls with the commit console while it is visible; dismiss failed output manually or automatically when repository files change and Git reports changes to commit.
 - Add Commit (skip hooks) and Commit (skip hooks) & Push options.
 
 ### Changed

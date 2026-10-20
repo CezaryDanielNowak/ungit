@@ -95,6 +95,12 @@ const baseDir = path.join(__dirname, '..');
     }
   }
 
+  // AI is an optional bundle loaded asynchronously after the commit form renders.
+  await browserifyFile(
+    path.join(baseDir, 'components/staging/ai-commit-message-entry.js'),
+    path.join(baseDir, 'components/staging/ai-commit-message.bundle.js')
+  );
+
   // copy
   console.log('copy bootstrap fonts');
   await Promise.all(

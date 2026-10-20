@@ -53,6 +53,10 @@ const gitExecutorProm = (args, retryCount) => {
   let timeoutTimer;
   return pLimit(() => {
     return new Promise((resolve, reject) => {
+      if (args.signal && args.signal.aborted) {
+        reject({ errorCode: 'commit-cancelled', error: 'Commit execution cancelled.' });
+        return;
+      }
       if (config.logGitCommands)
         logger.info(`git executing: ${args.repoPath} ${args.commands.join(' ')}`);
       let rejectedError = null;
@@ -63,30 +67,69 @@ const gitExecutorProm = (args, retryCount) => {
       const procOpts = {
         cwd: args.repoPath,
         maxBuffer: 1024 * 1024 * 100,
-        detached: false,
+        detached: !!args.signal && !isWindows,
         env: env,
       };
       const gitProcess = child_process.spawn(gitBin, args.commands, procOpts);
+      let killTimer;
+      let stopped = false;
+      const stopProcess = (signal) => {
+        if (!gitProcess.pid) return;
+        if (isWindows) {
+          const killer = child_process.spawn('taskkill', [
+            '/pid',
+            String(gitProcess.pid),
+            '/T',
+            '/F',
+          ]);
+          killer.on('error', (error) => logger.warn('Could not stop Git process tree', error));
+        } else {
+          try {
+            process.kill(-gitProcess.pid, signal);
+          } catch (error) {
+            if (error.code !== 'ESRCH') logger.warn('Could not stop Git process tree', error);
+          }
+        }
+      };
+      const abort = () => {
+        if (stopped) return;
+        stopped = true;
+        stopProcess('SIGTERM');
+        killTimer = setTimeout(() => stopProcess('SIGKILL'), 1000);
+      };
+      if (args.signal) args.signal.addEventListener('abort', abort, { once: true });
       timeoutTimer = setTimeout(() => {
         if (!timeoutTimer) return;
         timeoutTimer = null;
 
         logger.warn(`command timedout: ${args.commands.join(' ')}\n`);
-        gitProcess.kill('SIGINT');
+        if (args.signal) abort();
+        else gitProcess.kill('SIGINT');
       }, args.timeout);
 
       if (args.outPipe) {
         gitProcess.stdout.pipe(args.outPipe);
       } else {
-        gitProcess.stdout.on('data', (data) => (stdout += data.toString()));
+        gitProcess.stdout.setEncoding('utf8');
+        gitProcess.stdout.on('data', (data) => {
+          stdout += data;
+          if (args.onOutput) args.onOutput(data);
+        });
       }
       if (args.inPipe) {
         gitProcess.stdin.end(args.inPipe);
       }
-      gitProcess.stderr.on('data', (data) => (stderr += data.toString()));
+      gitProcess.stderr.setEncoding('utf8');
+      gitProcess.stderr.on('data', (data) => {
+        stderr += data;
+        if (args.onOutput) args.onOutput(data);
+      });
       gitProcess.on('error', (error) => (rejectedError = error));
 
       gitProcess.on('close', (code) => {
+        if (args.signal) args.signal.removeEventListener('abort', abort);
+        if (stopped && !isWindows) stopProcess('SIGKILL');
+        clearTimeout(killTimer);
         if (config.logGitCommands)
           logger.info(
             `git result (first 400 bytes): ${args.commands.join(' ')}\n${stderr.slice(
@@ -98,6 +141,13 @@ const gitExecutorProm = (args, retryCount) => {
           reject(rejectedError);
         } else if (code === 0 || (code === 1 && args.allowError)) {
           resolve(stdout);
+        } else if (args.signal && args.signal.aborted) {
+          reject({
+            errorCode: 'commit-cancelled',
+            error: 'Commit execution cancelled.',
+            stdout,
+            stderr,
+          });
         } else {
           reject(getGitError(args, stderr, stdout));
         }
@@ -499,7 +549,7 @@ git.applyPatchedDiff = (repoPath, patchedDiff) => {
   }
 };
 
-git.commit = (repoPath, amend, emptyCommit, message, files, skipHooks = false) => {
+git.commit = (repoPath, amend, emptyCommit, message, files, skipHooks = false, execution = {}) => {
   return new Promise((resolve, reject) => {
     if (message == undefined) {
       reject({ error: 'Must specify commit message' });
@@ -568,8 +618,8 @@ git.commit = (repoPath, amend, emptyCommit, message, files, skipHooks = false) =
       const ammendFlag = amend ? '--amend' : '';
       const allowedEmptyFlag = emptyCommit || amend ? '--allow-empty' : '';
       const isGPGSign = config.isForceGPGSign ? '-S' : '';
-      return git(
-        [
+      return git({
+        commands: [
           ...(skipHooks ? ['-c', `core.hooksPath=${devNull}`] : []),
           'commit',
           ammendFlag,
@@ -578,14 +628,18 @@ git.commit = (repoPath, amend, emptyCommit, message, files, skipHooks = false) =
           '--file=-',
         ],
         repoPath,
-        null,
-        null,
-        message
-      );
+        inPipe: message,
+        signal: execution.signal,
+        onOutput: execution.onOutput,
+      });
     })
     .catch((err) => {
       // ignore the case where nothing were added to be committed
-      if (!err.stdout || err.stdout.indexOf('Changes not staged for commit') === -1) {
+      if (
+        err.errorCode === 'commit-cancelled' ||
+        !err.stdout ||
+        err.stdout.indexOf('Changes not staged for commit') === -1
+      ) {
         throw err;
       }
     });

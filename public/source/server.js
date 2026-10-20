@@ -44,8 +44,18 @@ Server.prototype.initSocket = function () {
   this.socket.on('working-tree-changed', function () {
     programEvents.dispatch({ event: 'working-tree-changed' });
   });
+  this.socket.on('worktree-file-changed', function (data) {
+    programEvents.dispatch({ event: 'worktree-file-changed', repository: data.repository });
+  });
   this.socket.on('git-directory-changed', function () {
     programEvents.dispatch({ event: 'git-directory-changed' });
+  });
+  this.socket.on('commit-output', function (data) {
+    programEvents.dispatch({
+      event: 'commit-output',
+      operationId: data.operationId,
+      output: data.output,
+    });
   });
   this.socket.on('request-credentials', function (args) {
     self._getCredentials(function (credentials) {
