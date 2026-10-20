@@ -9,6 +9,7 @@ const filesToDisplayIncrmentBy = 50;
 const filesToDisplayLimit = filesToDisplayIncrmentBy;
 const mergeTool = ungit.config.mergeTool;
 const { ComponentRoot } = require('../ComponentRoot');
+const loadAiCommitMessage = require('./load-ai-commit-message');
 
 components.register(
   'staging',
@@ -24,12 +25,22 @@ class StagingViewModel extends ComponentRoot {
     this.graph = graph;
     this.filesByPath = {};
     this.files = ko.observableArray();
+    this.currentBranch = ko.pureComputed(() => {
+      const branch = this.graph.checkedOutBranch();
+      return typeof branch === 'string' && !branch.startsWith('(') ? branch : null;
+    });
     this.commitMessageTitleCount = ko.observable(0);
     this.commitMessageTitle = ko.observable();
     this.commitMessageTitle.subscribe((value) => {
       this.commitMessageTitleCount(value.length);
     });
     this.commitMessageBody = ko.observable();
+    this.commitRunning = ko.observable(false);
+    this.commitCancelling = ko.observable(false);
+    this.showCommitConsole = ko.observable(false);
+    this.commitOutput = ko.observable('').extend({ rateLimit: 100 });
+    this.commitProgress = ko.observable('');
+    this.failedConsoleChangeVersion = 0;
     this.commitActions = [
       { label: 'Commit', className: 'commit-only', skipHooks: false, push: false },
       { label: 'Commit & Push', className: 'commitnpush', skipHooks: false, push: true },
@@ -96,7 +107,12 @@ class StagingViewModel extends ComponentRoot {
     this.canStashAll = ko.computed(() => !this.amend());
     this.canPush = ko.computed(() => !!this.graph.currentRemote());
     this.showNux = ko.computed(
-      () => this.files().length == 0 && !this.amend() && !this.inRebase() && !this.emptyCommit()
+      () =>
+        !this.commitRunning() &&
+        this.files().length == 0 &&
+        !this.amend() &&
+        !this.inRebase() &&
+        !this.emptyCommit()
     );
     this.showCancelButton = ko.computed(() => this.amend() || this.emptyCommit());
     this.commitValidationError = ko.computed(() => {
@@ -144,18 +160,50 @@ class StagingViewModel extends ComponentRoot {
     this.stashIcon = octicons.pin.toSVG({ height: 15 });
     this.discardIcon = octicons.x.toSVG({ height: 18 });
     this.ignoreIcon = octicons.skip.toSVG({ height: 18 });
+    this.aiCommitMessage = ko.observable(null);
   }
 
   updateNode(parentElement) {
     ko.renderTemplate('staging', this, {}, parentElement);
+    let disposed = false;
+    ko.utils.domNodeDisposal.addDisposeCallback(parentElement, () => {
+      disposed = true;
+      this.aiCommitMessage()?.dispose();
+    });
+    loadAiCommitMessage(ungit.config.rootPath)
+      .then((AiCommitMessage) => {
+        if (disposed || this.aiCommitMessage()) return;
+        const ai = new AiCommitMessage(this, storage);
+        this.aiCommitMessage(ai);
+        ai.start();
+      })
+      .catch(() => {
+        // Optional AI loading must never prevent viewing changes or committing.
+      });
   }
 
   onProgramEvent(event) {
+    if (event.event === 'worktree-file-changed' && event.repository === this.repoPath()) {
+      this.aiCommitMessage()?.invalidate();
+    }
+    if (
+      event.event === 'worktree-file-changed' &&
+      event.repository === this.repoPath() &&
+      this.commitFailed &&
+      !this.commitRunning()
+    ) {
+      this.failedConsoleChangeVersion++;
+      this.refreshContent();
+    }
+    if (event.event === 'commit-output' && event.operationId === this.commitOperationId) {
+      this.commitOutput((this.commitOutput() + event.output).slice(-100000));
+    }
     if (
       event.event == 'request-app-content-refresh' ||
       event.event === 'working-tree-changed' ||
       event.event === 'git-directory-changed'
     ) {
+      this.aiCommitMessage()?.invalidate();
       this.refreshContent();
       this.invalidateFilesDiffs();
     }
@@ -163,6 +211,8 @@ class StagingViewModel extends ComponentRoot {
 
   async _refreshContent() {
     ungit.logger.debug('staging.refreshContent() triggered');
+    const changeVersion = this.failedConsoleChangeVersion;
+    const operationId = this.commitOperationId;
 
     try {
       const headPromise = this.server.getPromise('/head', { path: this.repoPath(), limit: 1 });
@@ -179,7 +229,18 @@ class StagingViewModel extends ComponentRoot {
       }
 
       const status = await statusPromise;
+      if (
+        changeVersion > 0 &&
+        changeVersion === this.failedConsoleChangeVersion &&
+        operationId === this.commitOperationId
+      ) {
+        this.failedConsoleChangeVersion = 0;
+        if (this.commitFailed && !this.commitRunning() && Object.keys(status.files).length > 0) {
+          this.dismissCommitConsole();
+        }
+      }
       if (this.isSamePayload(status)) {
+        this.aiCommitMessage()?.refresh();
         return;
       }
 
@@ -233,6 +294,7 @@ class StagingViewModel extends ComponentRoot {
         this.commitMessageBody(lines.slice(1).join('\n'));
       }
     }
+    this.aiCommitMessage()?.refresh();
   }
 
   setFiles(files) {
@@ -298,7 +360,7 @@ class StagingViewModel extends ComponentRoot {
   }
 
   runSelectedCommitAction() {
-    if (this.commitValidationError()) return;
+    if (this.commitRunning() || this.commitValidationError()) return;
     const action = this.selectedCommitAction();
     if (action.push) {
       if (this.canPush()) this.commitnpush(action.skipHooks);
@@ -308,6 +370,7 @@ class StagingViewModel extends ComponentRoot {
   }
 
   commit(skipHooks = false) {
+    if (this.commitRunning()) return;
     const files = this.files()
       .filter((file) => file.editState() !== 'none')
       .map((file) => ({
@@ -317,24 +380,25 @@ class StagingViewModel extends ComponentRoot {
     let commitMessage = this.commitMessageTitle();
     if (this.commitMessageBody()) commitMessage += `\n\n${this.commitMessageBody()}`;
 
-    this.server
-      .postPromise('/commit', {
-        path: this.repoPath(),
-        message: commitMessage,
-        files,
-        amend: this.amend(),
-        emptyCommit: this.emptyCommit(),
-        skipHooks: skipHooks === true,
-      })
+    return this.requestCommit({
+      path: this.repoPath(),
+      message: commitMessage,
+      files,
+      amend: this.amend(),
+      emptyCommit: this.emptyCommit(),
+      skipHooks: skipHooks === true,
+    })
       .then(() => {
         this.resetMessages();
         programEvents.dispatch({ event: 'branch-updated' });
       })
-      .catch((e) => this.server.unhandledRejection(e));
+      .catch((e) => {
+        if (!e.commitConsoleHandled) this.server.unhandledRejection(e);
+      });
   }
 
   commitnpush(skipHooks = false) {
-    if (!this.canPush()) return;
+    if (this.commitRunning() || !this.canPush()) return;
     const files = this.files()
       .filter((file) => file.editState() !== 'none')
       .map((file) => ({
@@ -344,15 +408,14 @@ class StagingViewModel extends ComponentRoot {
     let commitMessage = this.commitMessageTitle();
     if (this.commitMessageBody()) commitMessage += `\n\n${this.commitMessageBody()}`;
 
-    this.server
-      .postPromise('/commit', {
-        path: this.repoPath(),
-        message: commitMessage,
-        files,
-        amend: this.amend(),
-        emptyCommit: this.emptyCommit(),
-        skipHooks: skipHooks === true,
-      })
+    return this.requestCommit({
+      path: this.repoPath(),
+      message: commitMessage,
+      files,
+      amend: this.amend(),
+      emptyCommit: this.emptyCommit(),
+      skipHooks: skipHooks === true,
+    })
       .then(() => {
         this.resetMessages();
         return this.server.postPromise('/push', {
@@ -361,6 +424,7 @@ class StagingViewModel extends ComponentRoot {
         });
       })
       .catch((err) => {
+        if (err.commitConsoleHandled) return;
         if (err.errorCode == 'non-fast-forward') {
           components.showModal('yesnomodal', {
             title: 'Force push?',
@@ -377,6 +441,75 @@ class StagingViewModel extends ComponentRoot {
         } else {
           this.server.unhandledRejection(err);
         }
+      });
+  }
+
+  requestCommit(payload) {
+    this.failedConsoleChangeVersion = 0;
+    this.commitFailed = false;
+    this.commitOperationId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    this.commitRunning(true);
+    this.commitCancelling(false);
+    this.showCommitConsole(false);
+    this.commitOutput('');
+    this.commitProgress('Running commit…');
+    const timer = setTimeout(() => this.showCommitConsole(true), 500);
+    return this.server
+      .postPromise('/commit', { ...payload, operationId: this.commitOperationId })
+      .then((result) => {
+        if (this.commitCancelling()) {
+          this.resetMessages();
+          throw { errorCode: 'commit-cancelled', commitCompleted: true };
+        }
+        this.commitProgress('Commit completed.');
+        this.showCommitConsole(false);
+        return result;
+      })
+      .catch((error) => {
+        error.commitConsoleHandled = true;
+        this.commitFailed = error.errorCode !== 'commit-cancelled';
+        this.showCommitConsole(true);
+        this.commitProgress(
+          error.commitCompleted
+            ? 'Commit completed before it could be stopped. Push was not started.'
+            : error.errorCode === 'commit-cancelled'
+              ? 'Execution cancelled. If Git had already created the commit, it has been kept.'
+              : 'Commit failed.'
+        );
+        const details = error.error && error.error.body;
+        if (details && !this.commitOutput()) {
+          this.commitOutput(details.stderr || details.error || error.errorSummary);
+        }
+        throw error;
+      })
+      .finally(() => {
+        clearTimeout(timer);
+        this.commitRunning(false);
+        this.commitCancelling(false);
+      });
+  }
+
+  dismissCommitConsole() {
+    if (this.commitRunning()) return;
+    this.failedConsoleChangeVersion = 0;
+    this.showCommitConsole(false);
+    this.commitFailed = false;
+    this.commitOutput('');
+    this.commitOperationId = null;
+  }
+
+  cancelCommit() {
+    if (!this.commitRunning() || this.commitCancelling()) return;
+    this.commitCancelling(true);
+    this.commitProgress('Stopping commit…');
+    return this.server
+      .postPromise('/commit/cancel', {
+        path: this.repoPath(),
+        operationId: this.commitOperationId,
+      })
+      .catch((error) => {
+        this.commitCancelling(false);
+        this.server.unhandledRejection(error);
       });
   }
 

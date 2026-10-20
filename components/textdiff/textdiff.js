@@ -207,6 +207,7 @@ class TextDiffViewModel {
 
   togglePatchLine(index) {
     this.patchLineList()[index] = !this.patchLineList()[index];
+    this.patchLineList.valueHasMutated();
 
     if (this.patchLineList()[index]) {
       this.numberOfSelectedPatchLines++;

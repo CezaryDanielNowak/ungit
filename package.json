@@ -13,6 +13,7 @@
     "clicktest": "mocha --config .mochaclicktest.json",
     "coverage": "nyc npm run unittest",
     "lint": "eslint .",
+    "link-glob": "npm link && npm run build",
     "format": "npm run lint -- --fix",
     "build": "node --trace-deprecation ./scripts/build.js",
     "watch": "nodemon -C --exec \"npm run build\" -e js,less -w public/source -w public/less -w components/ -i \"*.bundle.js\"",
