@@ -66,7 +66,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ungit
-          path: ungit-*.tgz
+          path: ungit-ai-*.tgz
           archive: false
           retention-days: 7
 

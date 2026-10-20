@@ -24,17 +24,31 @@ Quick intro to ungit: [https://youtu.be/hkBVAi3oKvo](https://youtu.be/hkBVAi3oKv
 
 [![Screenshot](screenshot.png)](https://youtu.be/hkBVAi3oKvo)
 
+Differences from the original ungit
+----------------------------------
+This fork adds AI-generated commit messages to the staging workflow. In supported browsers, Gemini Nano runs locally in the browser to draft a commit title and description that you can review and edit before committing.
+
+Use the **AI download** button to download the browser's model when needed:
+
+![AI download button in the staging toolbar](docs/screenshots/ai-commit-message-download.png)
+
+The generated title and description appear directly in the commit form:
+
+![AI-generated commit title and description alongside the files to be committed](docs/screenshots/ai-generated-commit-message.png)
+
 Installing
 ----------
 Requires [node.js](https://nodejs.org) (≥ 20.19.0), [npm](https://www.npmjs.com/) (≥ 10.8.2, comes with node.js) and [git](https://git-scm.com/) (≥ 2.34.x). To install ungit just type:
 
-	npm install -g ungit
+	npm install -g ungit-ai
 
 NOTE: If your system requires root access to install global npm packages, make sure you use the -H flag:
 
-	sudo -H npm install -g ungit
+	sudo -H npm install -g ungit-ai
 
-Prebuilt [electron](https://electronjs.org/) packages are available [here](https://github.com/FredrikNoren/ungit/releases) (git is still required).
+If you already installed the original package globally, run `npm uninstall -g ungit` first: both packages provide the same `ungit` command.
+
+Prebuilt [electron](https://electronjs.org/) packages for the original ungit are available [here](https://github.com/FredrikNoren/ungit/releases) (git is still required).
 
 Using
 -----
@@ -103,6 +117,25 @@ Text Editor Integrations
 
 ![VSCode-Ungit screenshot](https://raw.githubusercontent.com/hirse/vscode-ungit/master/screenshots/ungit.gif)
 
+
+Publishing this fork to npm
+---------------------------
+The npm package is named `ungit-ai`; its installed command remains `ungit`.
+
+From a clean checkout with Node.js and npm installed:
+
+```sh
+npm ci
+npm run lint
+npm run unittest
+npm pack --dry-run
+npm login
+npm publish
+```
+
+The `prepack` script builds the browser assets before packing or publishing. Publishing uses the public npm registry and public access configured in `package.json`. Complete any authentication or two-factor prompt from npm in your terminal.
+
+For subsequent releases, update the version with `npm version patch` (or `minor` / `major`) before publishing. Each published version must be unique. The inherited CI publishing job is restricted to the upstream repository; releases of this fork are published manually using the commands above.
 
 Developing
 ----------

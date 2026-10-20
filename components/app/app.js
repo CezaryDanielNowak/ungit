@@ -25,7 +25,7 @@ class AppViewModel {
     this.latestVersion = ko.observable();
     this.showNewVersionAvailable = ko.observable();
     this.newVersionInstallCommand =
-      (ungit.platform == 'win32' ? '' : 'sudo -H ') + 'npm update -g ungit';
+      (ungit.platform == 'win32' ? '' : 'sudo -H ') + 'npm update -g ungit-ai';
     this.bugtrackingEnabled = ko.observable(ungit.config.bugtracking);
     this.bugtrackingNagscreenDismissed = ko.observable(
       storage.getItem('bugtrackingNagscreenDismissed')
