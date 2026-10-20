@@ -41,6 +41,7 @@ describe('automatic commit messages', () => {
       emptyCommit: ko.observable(false),
       conflictText: ko.observable(''),
       repoPath: ko.observable('/repo'),
+      currentBranch: ko.observable('feature/test'),
       files: ko.observableArray([
         {
           name: () => 'file.js',
@@ -138,7 +139,7 @@ describe('automatic commit messages', () => {
       throw new Error('Binary files must not be requested');
     };
     await ai.generate();
-    expect(JSON.parse(prompts[0].split('\n\n')[1])).to.eql([
+    expect(JSON.parse(prompts[0].split('\n\n')[1]).changes).to.eql([
       { file: 'file.js', selection: 'staged', contentOmitted: true },
     ]);
     vm.files()[0].fileType = () => 'text';
@@ -166,7 +167,7 @@ describe('automatic commit messages', () => {
     };
     await ai.generate();
     const input = prompts[0].split('\n\n').slice(1).join('\n\n');
-    const changes = JSON.parse(input);
+    const changes = JSON.parse(input).changes;
     expect(input.length).to.be.lessThan(24001);
     expect(changes).to.have.length(6);
     const withDiffs = changes.filter((change) => change.diff);
@@ -194,6 +195,55 @@ describe('automatic commit messages', () => {
     await ai.generate();
     expect(vm.commitMessageTitle()).to.be('Update feature');
     expect(prompts).to.have.length(2);
+  });
+
+  it('includes the current branch and regenerates for a branch change', async () => {
+    await ai.generate();
+    expect(JSON.parse(prompts[0].split('\n\n')[1]).branch).to.be('feature/test');
+    vm.currentBranch('fix/redirect-handler');
+    await ai.generate();
+    expect(JSON.parse(prompts[1].split('\n\n')[1]).branch).to.be('fix/redirect-handler');
+    vm.currentBranch(null);
+    await ai.generate();
+    expect(JSON.parse(prompts[2].split('\n\n')[1]).branch).to.be(null);
+  });
+
+  it('shows each preparation stage while leaving the form editable', async () => {
+    let finishDiff;
+    let finishModel;
+    let finishResponse;
+    vm.server.getPromise = () => new Promise((resolve) => (finishDiff = resolve));
+    browser.LanguageModel.create = () => new Promise((resolve) => (finishModel = resolve));
+    const pending = ai.generate();
+    expect(ai.buttonText()).to.be('AI preparing message…');
+    expect(ai.busy()).to.be(true);
+    finishDiff(diff);
+    await Promise.resolve();
+    expect(ai.buttonText()).to.be('AI loading model…');
+    finishModel({
+      prompt: () => new Promise((resolve) => (finishResponse = resolve)),
+      destroy: () => destroyed++,
+    });
+    await Promise.resolve();
+    expect(ai.buttonText()).to.be('AI waiting for response…');
+    vm.commitMessageTitle('Human title while waiting');
+    finishResponse(JSON.stringify({ title: 'Stale response', body: 'Body' }));
+    await pending;
+    expect(vm.commitMessageTitle()).to.be('Human title while waiting');
+    expect(ai.buttonText()).to.be('AI enabled');
+    expect(ai.busy()).to.be(false);
+  });
+
+  it('indicates pending availability checks', async () => {
+    let finish;
+    browser.LanguageModel.availability = () => new Promise((resolve) => (finish = resolve));
+    const pending = ai.checkAvailability();
+    expect(ai.buttonText()).to.be('AI checking…');
+    expect(ai.busy()).to.be(true);
+    finish('available');
+    await pending;
+    expect(ai.buttonText()).to.be('AI enabled');
+    expect(ai.busy()).to.be(false);
   });
 
   it('preserves human text in either field, including edits to generated content', async () => {
@@ -244,6 +294,7 @@ describe('automatic commit messages', () => {
       () => ai.enabled(false),
       () => ai.refresh(),
       () => vm.repoPath('/other-repo'),
+      () => vm.currentBranch('other-branch'),
       () => ai.dispose(),
     ]) {
       let finish;

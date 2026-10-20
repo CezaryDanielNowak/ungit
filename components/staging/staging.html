@@ -162,7 +162,8 @@
               <button
                 type="button"
                 class="btn btn-default ai-commit-toggle"
-                data-bind="click: toggle, text: downloading() ? 'AI downloading…' : downloadable() ? 'AI download' : enabled() ? 'AI enabled' : 'AI disabled', disable: downloading, css: {active: available() && enabled()}, attr: {'aria-pressed': available() && enabled() ? 'true' : 'false'}"
+                data-bind="click: toggle, text: buttonText, disable: downloading, css: {active: available() && enabled()}, attr: {'aria-pressed': available() && enabled() ? 'true' : 'false', 'aria-busy': busy() ? 'true' : 'false'}"
+                aria-live="polite"
                 title="Automatically generate commit messages with Gemini Nano"
               ></button>
               <!-- /ko -->

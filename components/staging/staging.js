@@ -25,6 +25,7 @@ class StagingViewModel extends ComponentRoot {
     this.graph = graph;
     this.filesByPath = {};
     this.files = ko.observableArray();
+    this.currentBranch = ko.observable(null);
     this.commitMessageTitleCount = ko.observable(0);
     this.commitMessageTitle = ko.observable();
     this.commitMessageTitle.subscribe((value) => {
@@ -273,6 +274,7 @@ class StagingViewModel extends ComponentRoot {
   }
 
   loadStatus(status) {
+    this.currentBranch(status.branch || null);
     this.setFiles(status.files);
     this.inRebase(!!status.inRebase);
     this.inMerge(!!status.inMerge);
