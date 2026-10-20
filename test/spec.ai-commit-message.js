@@ -11,6 +11,8 @@ describe('automatic commit messages', () => {
   let diff;
   let prompts;
   let destroyed;
+  let creates;
+  let advance;
   let respond;
 
   beforeEach(async () => {
@@ -18,17 +20,39 @@ describe('automatic commit messages', () => {
     diff = '+first change';
     prompts = [];
     destroyed = 0;
+    creates = 0;
     respond = async () => JSON.stringify({ title: 'Add feature', body: 'Explain the change' });
     browser = new EventTarget();
+    let now = 0;
+    let timerId = 0;
+    const timers = new Map();
+    browser.setTimeout = (callback, delay) => {
+      const id = ++timerId;
+      timers.set(id, { callback, deadline: now + delay });
+      return id;
+    };
+    browser.clearTimeout = (id) => timers.delete(id);
+    advance = (milliseconds) => {
+      now += milliseconds;
+      for (const [id, timer] of timers) {
+        if (timer.deadline <= now) {
+          timers.delete(id);
+          timer.callback();
+        }
+      }
+    };
     browser.LanguageModel = {
       availability: async () => 'available',
-      create: async () => ({
-        prompt: async (input) => {
-          prompts.push(input);
-          return respond();
-        },
-        destroy: () => destroyed++,
-      }),
+      create: async () => {
+        creates++;
+        return {
+          prompt: async (input) => {
+            prompts.push(input);
+            return respond();
+          },
+          destroy: () => destroyed++,
+        };
+      },
     };
     page = new EventTarget();
     page.hidden = false;
@@ -117,7 +141,7 @@ describe('automatic commit messages', () => {
     expect(ai.available()).to.be(true);
     expect(ai.enabled()).to.be(false);
     expect(vm.commitMessageTitle()).to.be('Human title during download');
-    expect(destroyed).to.be(1);
+    expect(destroyed).to.be(0);
   });
 
   it('allows retrying failed downloads', async () => {
@@ -185,7 +209,7 @@ describe('automatic commit messages', () => {
     expect(vm.commitMessageTitle()).to.be('Add feature');
     expect(vm.commitMessageBody()).to.be('Explain the change');
     expect(prompts[0]).to.contain(diff);
-    expect(destroyed).to.be(1);
+    expect(destroyed).to.be(0);
     ai.refresh();
     await ai.generate();
     expect(prompts).to.have.length(1);
@@ -208,10 +232,78 @@ describe('automatic commit messages', () => {
     expect(JSON.parse(prompts[2].split('\n\n')[1]).branch).to.be(null);
   });
 
+  it('reuses the session and restarts its two-minute idle timeout on every use', async () => {
+    await ai.generate();
+    expect(creates).to.be(1);
+    expect(destroyed).to.be(0);
+    advance(119000);
+    diff = '+second change';
+    await ai.generate();
+    expect(creates).to.be(1);
+    advance(119999);
+    expect(destroyed).to.be(0);
+    advance(1);
+    expect(destroyed).to.be(1);
+    expect(ai.session).to.be(null);
+    diff = '+third change';
+    await ai.generate();
+    expect(creates).to.be(2);
+    ai.dispose();
+    expect(destroyed).to.be(2);
+    advance(120000);
+    expect(destroyed).to.be(2);
+  });
+
+  it('keeps a session alive during a long inference and expires it two minutes afterward', async () => {
+    await ai.generate();
+    let finish;
+    let started;
+    const ready = new Promise((resolve) => (started = resolve));
+    respond = () => {
+      started();
+      return new Promise((resolve) => (finish = resolve));
+    };
+    diff = '+slow change';
+    const pending = ai.generate();
+    await ready;
+    advance(180000);
+    expect(destroyed).to.be(0);
+    finish(JSON.stringify({ title: 'Complete slow change', body: 'Details' }));
+    await pending;
+    advance(119999);
+    expect(destroyed).to.be(0);
+    advance(1);
+    expect(destroyed).to.be(1);
+  });
+
+  it('does not extend the idle timeout when unchanged input skips inference', async () => {
+    await ai.generate();
+    advance(119000);
+    await ai.generate();
+    expect(prompts).to.have.length(1);
+    advance(1000);
+    expect(destroyed).to.be(1);
+  });
+
+  it('recreates a session after inference fails', async () => {
+    respond = async () => {
+      throw new Error('Inference failed');
+    };
+    await ai.generate();
+    expect(destroyed).to.be(1);
+    expect(ai.session).to.be(null);
+    respond = async () => JSON.stringify({ title: 'Retry', body: 'Details' });
+    await ai.generate();
+    expect(creates).to.be(2);
+    expect(vm.commitMessageTitle()).to.be('Retry');
+  });
+
   it('shows each preparation stage while leaving the form editable', async () => {
     let finishDiff;
     let finishModel;
     let finishResponse;
+    let responseStarted;
+    const waiting = new Promise((resolve) => (responseStarted = resolve));
     vm.server.getPromise = () => new Promise((resolve) => (finishDiff = resolve));
     browser.LanguageModel.create = () => new Promise((resolve) => (finishModel = resolve));
     const pending = ai.generate();
@@ -221,10 +313,13 @@ describe('automatic commit messages', () => {
     await Promise.resolve();
     expect(ai.buttonText()).to.be('AI loading model…');
     finishModel({
-      prompt: () => new Promise((resolve) => (finishResponse = resolve)),
+      prompt: () => {
+        responseStarted();
+        return new Promise((resolve) => (finishResponse = resolve));
+      },
       destroy: () => destroyed++,
     });
-    await Promise.resolve();
+    await waiting;
     expect(ai.buttonText()).to.be('AI waiting for response…');
     vm.commitMessageTitle('Human title while waiting');
     finishResponse(JSON.stringify({ title: 'Stale response', body: 'Body' }));
@@ -284,15 +379,53 @@ describe('automatic commit messages', () => {
     expect(prompts).to.have.length(0);
   });
 
-  it('discards pending results after edits, blur, disabling, changes, navigation, or disposal', async () => {
+  it('applies in-flight results after blur and hiding, but starts no new work while unfocused', async () => {
+    let finish;
+    let started;
+    const ready = new Promise((resolve) => (started = resolve));
+    respond = () => {
+      started();
+      return new Promise((resolve) => (finish = resolve));
+    };
+    const pending = ai.generate();
+    await ready;
+    page.hasFocus = () => false;
+    browser.dispatchEvent(new Event('blur'));
+    page.hidden = true;
+    page.dispatchEvent(new Event('visibilitychange'));
+    finish(JSON.stringify({ title: 'Finished in background', body: 'Completed response' }));
+    await pending;
+    expect(vm.commitMessageTitle()).to.be('Finished in background');
+    expect(vm.commitMessageBody()).to.be('Completed response');
+    diff = '+new change while hidden';
+    await ai.generate();
+    expect(prompts).to.have.length(1);
+  });
+
+  it('applies an already requested response after refreshes or disabling AI', async () => {
+    let finish;
+    let started;
+    const ready = new Promise((resolve) => (started = resolve));
+    respond = () => {
+      started();
+      return new Promise((resolve) => (finish = resolve));
+    };
+    const pending = ai.generate();
+    await ready;
+    ai.refresh();
+    ai.enabled(false);
+    finish(JSON.stringify({ title: 'Complete requested message', body: 'Completed response' }));
+    await pending;
+    expect(vm.commitMessageTitle()).to.be('Complete requested message');
+    expect(vm.commitMessageBody()).to.be('Completed response');
+    diff = '+new change while disabled';
+    await ai.generate();
+    expect(prompts).to.have.length(1);
+  });
+
+  it('protects human edits and rejects results belonging to another repository, branch, or disposed view', async () => {
     for (const invalidate of [
       () => vm.commitMessageBody('Typed while generating'),
-      () => {
-        page.hasFocus = () => false;
-        browser.dispatchEvent(new Event('blur'));
-      },
-      () => ai.enabled(false),
-      () => ai.refresh(),
       () => vm.repoPath('/other-repo'),
       () => vm.currentBranch('other-branch'),
       () => ai.dispose(),
@@ -347,9 +480,10 @@ describe('automatic commit messages', () => {
     browser.LanguageModel.create = async () => {
       throw new Error('Model failed');
     };
+    ai.destroySession();
     await ai.generate();
     expect(vm.commitMessageTitle()).to.be('');
-    expect(destroyed).to.be(3);
+    expect(destroyed).to.be(1);
   });
 
   it('allows human edits while model initialization is pending', async () => {
@@ -373,6 +507,25 @@ describe('automatic commit messages', () => {
     await pending;
     expect(vm.commitMessageTitle()).to.be('Written while the model loads');
     expect(prompts).to.have.length(0);
+    expect(destroyed).to.be(0);
+  });
+
+  it('destroys a session that finishes initializing after the view is disposed', async () => {
+    let finish;
+    let started;
+    const ready = new Promise((resolve) => (started = resolve));
+    browser.LanguageModel.create = () => {
+      started();
+      return new Promise((resolve) => (finish = resolve));
+    };
+    const pending = ai.generate();
+    await ready;
+    ai.dispose();
+    finish({ destroy: () => destroyed++ });
+    await pending;
+    expect(ai.session).to.be(null);
+    expect(destroyed).to.be(1);
+    advance(120000);
     expect(destroyed).to.be(1);
   });
 });

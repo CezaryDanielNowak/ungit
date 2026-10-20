@@ -3,6 +3,7 @@ const _ = require('lodash');
 const { maxDiffChars, maxPromptChars } = require('../../source/ai-commit-limits');
 
 const storageKey = 'aiCommitMessageEnabled';
+const sessionIdleTimeout = 2 * 60 * 1000;
 
 // All inference stays in the browser's Gemini Nano model.
 module.exports = class AiCommitMessage {
@@ -27,20 +28,28 @@ module.exports = class AiCommitMessage {
     });
     this.availabilityChecks = 0;
     this.version = 0;
+    this.messageVersion = 0;
     this.generated = null;
     this.lastInput = null;
+    this.session = null;
+    this.sessionPromise = null;
+    this.sessionTimer = null;
     this.focused = ko.observable(false);
     this.schedule = _.debounce(() => this.generate(), 600);
     this.onFocus = () => {
       this.focused(!page.hidden && page.hasFocus());
-      this.refresh();
       this.checkAvailability();
     };
     this.subscriptions = [
+      this.focused.subscribe(() => {
+        this.schedule.cancel();
+        if (this.canGenerate()) this.schedule();
+      }),
       this.enabled.subscribe((enabled) => storage.setItem(storageKey, String(enabled))),
       ...[staging.commitMessageTitle, staging.commitMessageBody].map((field) =>
         field.subscribe(() => {
           if (this.writing) return;
+          this.messageVersion++;
           // Once edited, even a previously generated message belongs to the user.
           this.generated = null;
           this.lastInput = null;
@@ -56,7 +65,7 @@ module.exports = class AiCommitMessage {
     this.page.addEventListener('visibilitychange', this.onFocus);
     this.focused(!this.page.hidden && this.page.hasFocus());
     this.effect = ko.computed(() => {
-      this.canGenerate();
+      this.canGenerate(false);
       this.refresh();
     });
     this.checkAvailability();
@@ -92,20 +101,58 @@ module.exports = class AiCommitMessage {
   async download() {
     if (this.disposed || this.downloading() || !this.downloadable()) return;
     this.downloading(true);
-    let session;
     try {
       // Call create directly from the click to preserve browser user activation.
-      session = await this.browser.LanguageModel.create();
+      await this.getSession();
     } catch {
       // Leave the commit form usable and allow retrying a failed download.
     } finally {
-      if (session) session.destroy();
       await this.checkAvailability();
       this.downloading(false);
+      this.restartSessionTimer();
     }
   }
 
-  canGenerate() {
+  async getSession() {
+    if (this.disposed) return null;
+    this.clearSessionTimer();
+    if (this.session) return this.session;
+    if (!this.sessionPromise) {
+      this.sessionPromise = this.browser.LanguageModel.create()
+        .then((session) => {
+          if (this.disposed) {
+            session.destroy();
+            return null;
+          }
+          this.session = session;
+          return session;
+        })
+        .finally(() => {
+          this.sessionPromise = null;
+        });
+    }
+    return this.sessionPromise;
+  }
+
+  clearSessionTimer() {
+    if (this.sessionTimer !== null) this.browser.clearTimeout(this.sessionTimer);
+    this.sessionTimer = null;
+  }
+
+  restartSessionTimer() {
+    this.clearSessionTimer();
+    if (!this.session || this.disposed || this.running || this.downloading()) return;
+    this.sessionTimer = this.browser.setTimeout(() => this.destroySession(), sessionIdleTimeout);
+  }
+
+  destroySession() {
+    this.clearSessionTimer();
+    const session = this.session;
+    this.session = null;
+    if (session) session.destroy();
+  }
+
+  canGenerate(requireFocus = true) {
     const vm = this.staging;
     const title = vm.commitMessageTitle() || '';
     const body = vm.commitMessageBody() || '';
@@ -124,7 +171,7 @@ module.exports = class AiCommitMessage {
       !this.disposed &&
       this.available() &&
       this.enabled() &&
-      this.focused() &&
+      (!requireFocus || this.focused()) &&
       selected &&
       !blocked &&
       ((!title && !body) ||
@@ -139,7 +186,7 @@ module.exports = class AiCommitMessage {
 
   refresh() {
     this.invalidate();
-    if (this.canGenerate()) this.schedule();
+    if (ko.ignoreDependencies(() => this.canGenerate())) this.schedule();
   }
 
   async generate() {
@@ -149,11 +196,22 @@ module.exports = class AiCommitMessage {
     const vm = this.staging;
     const path = vm.repoPath();
     const branch = vm.currentBranch();
+    const messageVersion = this.messageVersion;
     const current = () =>
       version === this.version &&
       path === vm.repoPath() &&
       branch === vm.currentBranch() &&
-      this.canGenerate();
+      this.canGenerate(false);
+    // Once inference starts, focus and ordinary refreshes cannot reject its result.
+    const canApply = () =>
+      !this.disposed &&
+      path === vm.repoPath() &&
+      branch === vm.currentBranch() &&
+      messageVersion === this.messageVersion &&
+      !vm.commitRunning() &&
+      !vm.amend() &&
+      !vm.emptyCommit() &&
+      !vm.conflictText();
     let session;
     try {
       this.phase('AI preparing message…');
@@ -197,8 +255,8 @@ module.exports = class AiCommitMessage {
       if (!changes.length) return;
       const input = JSON.stringify({ branch, changes });
       if (!current() || input === this.lastInput) return;
-      this.phase('AI loading model…');
-      session = await this.browser.LanguageModel.create();
+      if (!this.session) this.phase('AI loading model…');
+      session = await this.getSession();
       if (!current()) return;
       const prompt =
         'Write a concise Git commit message for the changes below. ' +
@@ -211,10 +269,18 @@ module.exports = class AiCommitMessage {
         input;
       console.log('[ungit AI] Sending commit message prompt:', prompt);
       this.phase('AI waiting for response…');
-      const response = await session.prompt(prompt);
+      let response;
+      try {
+        response = await session.prompt(prompt);
+      } catch (error) {
+        if (this.session === session) this.destroySession();
+        throw error;
+      }
       console.log('[ungit AI] Commit message response:', response);
-      if (!current()) {
-        console.debug('[ungit AI] Response ignored: request changed or page is no longer focused.');
+      if (!canApply()) {
+        console.debug(
+          '[ungit AI] Response ignored: commit form was edited, closed, or changed context.'
+        );
         return;
       }
       const json = response
@@ -247,8 +313,8 @@ module.exports = class AiCommitMessage {
       // An unavailable model or failed inference must never interrupt committing.
       console.warn('[ungit AI] Commit message generation failed:', error);
     } finally {
-      if (session) session.destroy();
       this.running = false;
+      if (session) this.restartSessionTimer();
       this.phase('');
       if (version !== this.version && this.canGenerate()) this.schedule();
     }
@@ -257,6 +323,7 @@ module.exports = class AiCommitMessage {
   dispose() {
     this.disposed = true;
     this.invalidate();
+    this.destroySession();
     if (this.effect) this.effect.dispose();
     this.subscriptions.forEach((subscription) => subscription.dispose());
     this.busy.dispose();
