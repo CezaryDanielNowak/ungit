@@ -9,6 +9,12 @@ We are following the [Keep a Changelog](https://keepachangelog.com/) format.
 - Show live commit output after 500 ms and allow cancelling Git and its hook subprocesses from the staging panel.
 - Replace staging controls with the commit console while it is visible; dismiss failed output manually or automatically when repository files change and Git reports changes to commit.
 - Add Commit (skip hooks) and Commit (skip hooks) & Push options.
+- Generate commit titles and bodies locally with Gemini Nano using selected file changes, patch selections, and the current branch name. Preserve human edits and only replace empty or previously generated messages.
+- Add an AI enabled/disabled toggle next to No Wrap, enabled by default and saved in localStorage. Offer AI download when the model is downloadable and hide the control when unavailable.
+- Load AI asynchronously and show preparation, model loading, and response progress on the button. Reuse model sessions and destroy them after two minutes of inactivity.
+- Include binary and large filenames in AI input without their contents. Skip contents when either file version exceeds 100 KiB or its diff exceeds 12,000 characters, and limit change input to 24,000 characters while prioritizing filenames.
+- Start automatic generation only while the page is focused; apply responses already in flight after focus loss or routine refreshes, while protecting human edits and repository context.
+- Log AI prompts, raw responses, and rejection or failure reasons in the browser console.
 
 ### Changed
 - Selecting a commit option updates the main button without executing it; click the main button to run the selected action.
